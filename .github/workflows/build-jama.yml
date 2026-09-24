@@ -1,0 +1,204 @@
+# Hardened personal build of YouMod IPA (based on upstream ipa.yml).
+# Differences from upstream:
+#  - YouMod source is pinned to an audited commit (input youmod_ref)
+#  - theos / cyan pinned to commits; no third-party GitHub Actions except official actions/*
+#  - IPA MD5 verified before build
+#  - no prebuilt binaries: YouSlider (needs prebuilt alderis.deb) and Safari extension (.appex) removed
+#  - all app extensions stripped (cyan -e) -> only one App ID needed with a free Apple ID
+#  - output: private DRAFT release only, no external uploads
+name: Build YouMod IPA (hardened)
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct URL to the decrypted YouTube IPA"
+        required: true
+        type: string
+      ipa_md5:
+        description: "Expected MD5 of the IPA (empty = skip check)"
+        required: false
+        default: ""
+        type: string
+      youmod_ref:
+        description: "YouMod commit to build (audited)"
+        required: true
+        default: "2a57a93f1ef06b79a7e6bd7a59938bfc076e2751"
+        type: string
+      display_name:
+        description: "App Name"
+        default: "YouTube"
+        required: true
+        type: string
+      bundle_id:
+        description: "Bundle ID"
+        default: "com.google.ios.youtube"
+        required: true
+        type: string
+      youpip:
+        description: "YouPiP"
+        default: true
+        type: boolean
+      ytuhd:
+        description: "YTUHD"
+        default: true
+        type: boolean
+      ryd:
+        description: "Return-YouTube-Dislikes"
+        default: true
+        type: boolean
+      demc:
+        description: "DontEatMyContent"
+        default: true
+        type: boolean
+      ytweaks:
+        description: "YTweaks"
+        default: true
+        type: boolean
+      gonerino:
+        description: "Gonerino"
+        default: true
+        type: boolean
+      extras:
+        description: "YTABConfig + youtube-native-share + VolumeBoostYT"
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  THEOS_SHA: 88506b2c22e9e07dd4ed055f23c9e398a117a2c7   # roothide/theos
+  CYAN_SHA: 740d3716dcd98c20c000f12cdb88f1f0b2a533a4    # asdfzxcvbn/pyzule-rw
+  SDK: iPhoneOS26.5.sdk
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download and verify IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+          IPA_MD5: ${{ inputs.ipa_md5 }}
+        run: |
+          curl -fL --retry 3 -o youtube.ipa "$IPA_URL"
+          ACTUAL=$(md5 -q youtube.ipa)
+          echo "IPA md5: $ACTUAL"
+          if [ -n "$IPA_MD5" ] && [ "$ACTUAL" != "$IPA_MD5" ]; then
+            echo "::error::MD5 mismatch: expected $IPA_MD5, got $ACTUAL"; exit 1
+          fi
+          unzip -q youtube.ipa -d ytx
+          YT_VERSION=$(plutil -extract CFBundleShortVersionString raw ytx/Payload/YouTube.app/Info.plist)
+          echo "YT_VERSION=$YT_VERSION" >> $GITHUB_ENV
+          CRYPTID=$(otool -l ytx/Payload/YouTube.app/YouTube | awk '/cryptid/{print $2; exit}')
+          [ "$CRYPTID" = "0" ] || { echo "::error::IPA is encrypted (cryptid=$CRYPTID)"; exit 1; }
+
+      - name: Install dependencies
+        run: |
+          brew install make ldid meson ninja go
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+          echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: theos
+          key: theos-${{ env.THEOS_SHA }}-${{ env.SDK }}
+
+      - name: Setup Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          git clone --quiet https://github.com/roothide/theos.git theos
+          git -C theos checkout --quiet "$THEOS_SHA"
+          git -C theos submodule update --init --recursive --quiet
+          git clone --quiet --depth=1 -n --filter=tree:0 https://github.com/Tonwalter888/iOS-SDKs.git
+          cd iOS-SDKs && git sparse-checkout set --no-cone "$SDK" && git checkout --quiet
+          mv *.sdk "$THEOS/sdks"
+
+      - name: Headers
+        run: |
+          rm -rf "$THEOS/include/YouTubeHeader" "$THEOS/include/PSHeader" "$THEOS/include/YTHeaders"
+          git clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git "$THEOS/include/YouTubeHeader"
+          git clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git "$THEOS/include/PSHeader"
+          cp -r "$THEOS/include/YouTubeHeader" "$THEOS/include/YTHeaders"
+          sed -i '' 's/od -c "$i" | head/od -c "$i" 2>\/dev\/null | head/g' $THEOS/bin/convert_xml_plist.sh || true
+
+      - name: Install cyan (pinned)
+        run: pipx install "https://github.com/asdfzxcvbn/pyzule-rw/archive/${CYAN_SHA}.zip"
+
+      - name: Checkout YouMod (pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Tonwalter888/YouMod
+          ref: ${{ inputs.youmod_ref }}
+          path: YouMod
+
+      - name: Clone tweaks
+        run: |
+          clone() { git clone --quiet --depth=1 "$@"; }
+          clone https://github.com/PoomSmart/YouGroupSettings.git
+          clone https://github.com/PoomSmart/UncappedAVPlayer.git
+          ${{ inputs.youpip }}  && clone https://github.com/PoomSmart/YouPiP.git
+          ${{ inputs.ytuhd }}   && clone --recurse-submodules https://github.com/PoomSmart/YTUHD.git
+          ${{ inputs.ryd }}     && clone https://github.com/PoomSmart/Return-YouTube-Dislikes.git
+          ${{ inputs.demc }}    && clone https://github.com/therealFoxster/DontEatMyContent.git
+          ${{ inputs.ytweaks }} && clone https://github.com/fosterbarnes/YTweaks.git
+          ${{ inputs.gonerino }} && clone https://github.com/castdrian/Gonerino.git
+          if ${{ inputs.youpip || inputs.ytuhd }}; then clone https://github.com/PoomSmart/YTVideoOverlay.git; fi
+          if ${{ inputs.extras }}; then
+            clone https://github.com/PoomSmart/YTABConfig.git
+            clone https://github.com/jkhsjdhjs/youtube-native-share.git
+            clone https://github.com/VasirakCalgux/VolumeBoostYT.git
+          fi
+          echo "### Source commits" >> $GITHUB_STEP_SUMMARY
+          echo "- YouMod: ${{ inputs.youmod_ref }}" >> $GITHUB_STEP_SUMMARY
+          for d in */; do [ -d "$d/.git" ] && echo "- ${d%/}: $(git -C $d rev-parse HEAD)" >> $GITHUB_STEP_SUMMARY; done
+          true
+
+      - name: Build debs
+        run: |
+          set -e
+          build() { # dir [extra make args]
+            local d=$1; shift
+            [ -d "$d" ] || return 0
+            echo "::group::$d"
+            (cd "$d" && make clean package DEBUG=0 FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless "$@")
+            mv "$d"/packages/*.deb "${{ github.workspace }}/$(echo $d | tr 'A-Z' 'a-z').deb"
+            echo "::endgroup::"
+          }
+          build YouMod
+          build YouGroupSettings
+          build UncappedAVPlayer ARCHS=arm64
+          build YouPiP
+          if [ -d YTUHD ]; then (cd YTUHD && make libvpx dav1d); build YTUHD SIDELOAD=1; fi
+          build Return-YouTube-Dislikes
+          build DontEatMyContent
+          build YTweaks
+          build Gonerino
+          build YTVideoOverlay
+          build YTABConfig
+          if [ -d youtube-native-share ]; then git clone --quiet --depth=1 https://github.com/protocolbuffers/protobuf.git youtube-native-share/protobuf; build youtube-native-share ARCHS=arm64; fi
+          build VolumeBoostYT ARCHS=arm64
+          ls -la *.deb
+
+      - name: Inject tweaks
+        run: |
+          OUT="YouMod_${YT_VERSION}_$(echo ${{ inputs.youmod_ref }} | cut -c1-7).ipa"
+          cyan -i youtube.ipa -o "$OUT" -uwe -f *.deb -n "${{ inputs.display_name }}" -b "${{ inputs.bundle_id }}"
+          echo "OUT=$OUT" >> $GITHUB_ENV
+          echo "SHA256=$(shasum -a 256 "$OUT" | cut -d' ' -f1)" >> $GITHUB_ENV
+
+      - name: Create private draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "youmod-${YT_VERSION}-r${{ github.run_number }}" "$OUT" \
+            --repo "${{ github.repository }}" --draft \
+            --title "YouMod ${YT_VERSION} (run ${{ github.run_number }})" \
+            --notes "YouTube ${YT_VERSION}, YouMod ${{ inputs.youmod_ref }}. SHA256: ${SHA256}"
+          echo "### Draft release created: $OUT (sha256 $SHA256)" >> $GITHUB_STEP_SUMMARY
